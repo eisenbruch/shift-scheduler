@@ -1,0 +1,598 @@
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+from sqlalchemy.orm import Session
+import models
+
+class SchedulingEngine:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def check_constraints(
+        self,
+        staff: models.Staff,
+        shift_template: models.ShiftTemplate,
+        week_start_date: datetime,
+        specific_day: int = None
+    ) -> Tuple[bool, List[str]]:
+        """Check if staff member can be assigned to shift based on hard constraints."""
+        violations = []
+
+        # Check availability for the specific day being assigned
+        # If specific_day is provided, only check that day
+        # Otherwise check if they're available on at least ONE day in the template
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+        if specific_day is not None:
+            # Checking a specific day assignment
+            availability = self.db.query(models.Availability).filter(
+                models.Availability.staff_id == staff.id,
+                models.Availability.day_of_week == specific_day,
+                models.Availability.shift_template_id == shift_template.id
+            ).first()
+
+            if availability and not availability.is_available:
+                violations.append(f"{staff.name} is not available for {shift_template.name} on {day_names[specific_day]}")
+        else:
+            # General check - are they available on at least one day?
+            available_on_any_day = False
+            for day in shift_template.days_of_week:
+                availability = self.db.query(models.Availability).filter(
+                    models.Availability.staff_id == staff.id,
+                    models.Availability.day_of_week == day,
+                    models.Availability.shift_template_id == shift_template.id
+                ).first()
+
+                # If no availability record, or record shows available
+                if not availability or availability.is_available:
+                    available_on_any_day = True
+                    break
+
+            if not available_on_any_day:
+                violations.append(f"{staff.name} is not available for {shift_template.name} on any day")
+
+        # Check qualifications
+        if shift_template.required_qualifications:
+            staff_quals = set(staff.qualifications or [])
+            for qual, min_count in shift_template.required_qualifications.items():
+                if qual not in staff_quals:
+                    violations.append(f"{staff.name} lacks required qualification: {qual}")
+
+        # Check if already assigned to this shift template on this specific day for this week
+        from sqlalchemy import cast, Date
+        week_date_only = week_start_date.date()
+
+        if specific_day is not None:
+            # Check for assignment on this specific day
+            existing_assignment = self.db.query(models.WeekAssignment).filter(
+                models.WeekAssignment.staff_id == staff.id,
+                models.WeekAssignment.shift_template_id == shift_template.id,
+                models.WeekAssignment.day_of_week == specific_day,
+                cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+            ).first()
+
+            if existing_assignment:
+                violations.append(f"{staff.name} is already assigned to {shift_template.name} on {day_names[specific_day]} this week")
+                return False, violations
+
+        # Check if already assigned to another shift at overlapping time on the same day
+        if specific_day is not None:
+            # Only check for conflicts on this specific day
+            same_day_assignments = self.db.query(models.WeekAssignment).filter(
+                models.WeekAssignment.staff_id == staff.id,
+                models.WeekAssignment.day_of_week == specific_day,
+                cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+            ).all()
+
+            for assignment in same_day_assignments:
+                if assignment.shift_template_id == shift_template.id:
+                    continue  # Skip same template (already checked above)
+
+                # Check for time overlap
+                # TODO: Add actual time overlap checking logic
+                violations.append(f"{staff.name} is already assigned to {assignment.shift_template.name} on {day_names[specific_day]}")
+
+        # Check max shifts per week
+        week_shift_count = self.db.query(models.WeekAssignment).filter(
+            models.WeekAssignment.staff_id == staff.id,
+            cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+        ).count()
+
+        if week_shift_count >= staff.max_shifts_per_week:
+            violations.append(f"{staff.name} has reached maximum shifts per week ({staff.max_shifts_per_week})")
+
+        return len(violations) == 0, violations
+
+    def get_preference_score(self, staff: models.Staff, shift_template: models.ShiftTemplate, specific_day: int = None) -> float:
+        """Get staff preference score for a shift template across all its days."""
+        if specific_day is not None:
+            # If checking a specific day, return that day's score
+            preference = self.db.query(models.Preference).filter(
+                models.Preference.staff_id == staff.id,
+                models.Preference.day_of_week == specific_day,
+                models.Preference.shift_template_id == shift_template.id
+            ).first()
+            return preference.preference_score if preference else 0.0
+
+        # For multi-day templates, calculate average preference across all days
+        total_score = 0.0
+        days_with_prefs = 0
+
+        for day in shift_template.days_of_week:
+            preference = self.db.query(models.Preference).filter(
+                models.Preference.staff_id == staff.id,
+                models.Preference.day_of_week == day,
+                models.Preference.shift_template_id == shift_template.id
+            ).first()
+
+            if preference:
+                total_score += preference.preference_score
+                days_with_prefs += 1
+
+        # Return average preference, or 0.0 if no preferences set
+        return total_score / days_with_prefs if days_with_prefs > 0 else 0.0
+
+    def calculate_fairness_score(
+        self,
+        staff: models.Staff,
+        period_days: int = None,
+        start_date: datetime = None,
+        end_date: datetime = None
+    ) -> Dict:
+        """Calculate fairness metrics for a staff member over a period.
+
+        Args:
+            staff: Staff member to calculate metrics for
+            period_days: Bidirectional period (±days from now). Overridden by start_date/end_date if provided.
+            start_date: Custom start date for analysis window
+            end_date: Custom end date for analysis window
+        """
+        # Use custom date range if provided, otherwise use bidirectional period
+        if start_date is not None and end_date is not None:
+            past_cutoff_date = start_date
+            future_cutoff_date = end_date
+        elif period_days is not None:
+            past_cutoff_date = datetime.utcnow() - timedelta(days=period_days)
+            future_cutoff_date = datetime.utcnow() + timedelta(days=period_days)
+        else:
+            # Default to ±30 days
+            past_cutoff_date = datetime.utcnow() - timedelta(days=30)
+            future_cutoff_date = datetime.utcnow() + timedelta(days=30)
+
+        # Get all assignments in period (both past and future scheduled weeks)
+        assignments = self.db.query(models.WeekAssignment).filter(
+            models.WeekAssignment.staff_id == staff.id,
+            models.WeekAssignment.week_start_date >= past_cutoff_date,
+            models.WeekAssignment.week_start_date <= future_cutoff_date
+        ).all()
+
+        if not assignments:
+            return {
+                "total_shifts": 0,
+                "preference_fulfillment": 0.0,
+                "preferred_count": 0,
+                "avoided_count": 0
+            }
+
+        total_shifts = len(assignments)
+        preference_sum = 0.0
+        preferred_count = 0
+        avoided_count = 0
+
+        for assignment in assignments:
+            shift_template = assignment.shift_template
+            # CRITICAL: Use the specific day_of_week from the assignment
+            pref_score = self.get_preference_score(staff, shift_template, specific_day=assignment.day_of_week)
+            preference_sum += pref_score
+
+            # Count as "preferred" if score > 0.2 (positive preference)
+            # Count as "avoided" if score < -0.2 (negative preference)
+            if pref_score > 0.2:
+                preferred_count += 1
+            elif pref_score < -0.2:
+                avoided_count += 1
+
+        return {
+            "total_shifts": total_shifts,
+            "preference_fulfillment": preference_sum / total_shifts if total_shifts > 0 else 0.0,
+            "preferred_count": preferred_count,
+            "avoided_count": avoided_count
+        }
+
+    def generate_schedule_algorithmically(
+        self,
+        shift_templates: List[models.ShiftTemplate],
+        week_start_date: datetime
+    ) -> Dict:
+        """Generate optimal schedule using deterministic algorithm with fairness consideration."""
+
+        from sqlalchemy import cast, Date
+        week_date_only = week_start_date.date()
+
+        # Get all staff
+        all_staff = self.db.query(models.Staff).all()
+
+        # Build list of all shift slots that need filling
+        shift_slots = []
+        for template in shift_templates:
+            for day in template.days_of_week:
+                # Check how many already assigned
+                assigned_count = self.db.query(models.WeekAssignment).filter(
+                    models.WeekAssignment.shift_template_id == template.id,
+                    models.WeekAssignment.day_of_week == day,
+                    cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+                ).count()
+
+                # Add slots for remaining needed staff
+                for slot in range(assigned_count, template.required_staff):
+                    shift_slots.append({
+                        "shift_template_id": template.id,
+                        "day_of_week": day,
+                        "template": template
+                    })
+
+        print(f"DEBUG: Need to fill {len(shift_slots)} shift slots")
+
+        # Track staff workload across the entire analysis window (not just this week)
+        # This ensures long-term balance across multiple scheduled weeks
+        past_cutoff = datetime.utcnow() - timedelta(days=30)
+        future_cutoff = datetime.utcnow() + timedelta(days=30)
+
+        staff_shift_counts = {}
+        for staff in all_staff:
+            # Count all assignments in the 60-day window (past and future)
+            total_in_window = self.db.query(models.WeekAssignment).filter(
+                models.WeekAssignment.staff_id == staff.id,
+                models.WeekAssignment.week_start_date >= past_cutoff,
+                models.WeekAssignment.week_start_date <= future_cutoff
+            ).count()
+
+            # But also track just this week for max_shifts_per_week enforcement
+            this_week_count = self.db.query(models.WeekAssignment).filter(
+                models.WeekAssignment.staff_id == staff.id,
+                cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+            ).count()
+
+            staff_shift_counts[staff.id] = {
+                'total': total_in_window,
+                'this_week': this_week_count
+            }
+
+        assignments = []
+        conflicts = []
+
+        # Track which days each staff is working (to check for double shifts in this batch)
+        staff_days_working = {}  # staff_id -> set of days they're working
+
+        # Sort shift slots by difficulty (fewer available staff = harder to fill)
+        def count_available_staff(slot):
+            template = slot["template"]
+            day = slot["day_of_week"]
+            count = 0
+            for staff in all_staff:
+                staff_data = staff_shift_counts.get(staff.id, {'total': 0, 'this_week': 0})
+                if staff_data['this_week'] >= staff.max_shifts_per_week:
+                    continue
+                valid, _ = self.check_constraints(staff, template, week_start_date, specific_day=day)
+                if valid:
+                    count += 1
+            return count
+
+        shift_slots.sort(key=count_available_staff)
+
+        # Assign staff to slots
+        for slot in shift_slots:
+            template = slot["template"]
+            day = slot["day_of_week"]
+
+            # Find best available staff for this slot
+            candidates = []
+            for staff in all_staff:
+                staff_data = staff_shift_counts.get(staff.id, {'total': 0, 'this_week': 0})
+
+                # Check if staff can take this shift this week
+                if staff_data['this_week'] >= staff.max_shifts_per_week:
+                    continue
+
+                valid, violations = self.check_constraints(staff, template, week_start_date, specific_day=day)
+                if not valid:
+                    continue
+
+                # Calculate priority score (lower is better)
+                # Use TOTAL workload across all scheduled weeks, not just this week
+                current_load = staff_data['total']
+                pref_score = self.get_preference_score(staff, template, specific_day=day)
+                fairness = self.calculate_fairness_score(staff)
+                fairness_score = fairness.get("preference_fulfillment", 0.0)
+
+                # Check if they're already working another shift on this same day (double shift)
+                # Check both database and current batch
+                working_double = False
+
+                # Check database for existing assignments
+                existing_on_day = self.db.query(models.WeekAssignment).filter(
+                    models.WeekAssignment.staff_id == staff.id,
+                    models.WeekAssignment.day_of_week == day,
+                    cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+                ).first()
+
+                # Check current batch assignments
+                if staff.id in staff_days_working and day in staff_days_working[staff.id]:
+                    working_double = True
+                elif existing_on_day:
+                    working_double = True
+
+                # Priority: avoid double shifts, balance workload, consider preferences, balance fairness
+                priority = (
+                    (100 if working_double else 0)  # Heavily penalize double shifts - avoid unless necessary
+                    + current_load * 10  # Prioritize balancing workload
+                    - pref_score * 5   # Consider preferences
+                    - fairness_score * 3  # Balance historical fairness
+                )
+
+                candidates.append({
+                    "staff": staff,
+                    "priority": priority,
+                    "current_load": current_load,
+                    "pref_score": pref_score
+                })
+
+            if not candidates:
+                day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                conflicts.append({
+                    "shift_template_id": template.id,
+                    "day_of_week": day,
+                    "issue": f"No available staff for {template.name} on {day_names[day]}"
+                })
+                continue
+
+            # Pick best candidate
+            candidates.sort(key=lambda x: x["priority"])
+            best = candidates[0]
+
+            assignments.append({
+                "shift_template_id": template.id,
+                "staff_id": best["staff"].id,
+                "day_of_week": day,
+                "reasoning": f"Load: {best['current_load']}, Pref: {best['pref_score']:.1f}"
+            })
+
+            # Update workload tracker (both total and this week)
+            staff_data = staff_shift_counts.get(best["staff"].id, {'total': 0, 'this_week': 0})
+            staff_shift_counts[best["staff"].id] = {
+                'total': staff_data['total'] + 1,
+                'this_week': staff_data['this_week'] + 1
+            }
+
+            # Track which days this staff is working (for double shift detection)
+            if best["staff"].id not in staff_days_working:
+                staff_days_working[best["staff"].id] = set()
+            staff_days_working[best["staff"].id].add(day)
+
+        print(f"DEBUG: Generated {len(assignments)} assignments, {len(conflicts)} conflicts")
+
+        # Count double shifts
+        double_shift_count = 0
+        for staff_id, days in staff_days_working.items():
+            staff_member = next((s for s in all_staff if s.id == staff_id), None)
+            if staff_member:
+                # Check each day they're working
+                for day in days:
+                    day_assignments = [a for a in assignments if a["staff_id"] == staff_id and a["day_of_week"] == day]
+                    if len(day_assignments) > 1:
+                        double_shift_count += 1
+                        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                        print(f"DEBUG: {staff_member.name} working double shift on {day_names[day]}")
+
+        print(f"DEBUG: Total double shifts: {double_shift_count}")
+
+        # Calculate final workload summary
+        final_loads = {}
+        for staff in all_staff:
+            staff_data = staff_shift_counts.get(staff.id, {'total': 0, 'this_week': 0})
+            final_loads[staff.name] = f"{staff_data['this_week']} this week, {staff_data['total']} total"
+
+        return {
+            "assignments": assignments,
+            "conflicts": conflicts,
+            "fairness_summary": {
+                "explanation": f"Balanced workload algorithmically. Final loads: {final_loads}",
+                "recommendations": conflicts[:3] if conflicts else ["All shifts successfully filled"]
+            }
+        }
+
+    def validate_and_apply_schedule(
+        self,
+        schedule_result: Dict,
+        shift_templates: List[models.ShiftTemplate],
+        week_start_date: datetime
+    ) -> Dict:
+        """Validate algorithmically-generated schedule and apply it to database."""
+
+        successful_assignments = []
+        failed_assignments = []
+
+        # Track what we're assigning in this batch to prevent duplicates
+        assignment_tracker = set()  # (staff_id, template_id, day_of_week)
+
+        # Track shift counts per staff in this batch to enforce max_shifts_per_week
+        staff_shift_counts = {}  # staff_id -> count of shifts in this batch
+
+        # Initialize with existing counts from database
+        from sqlalchemy import cast, Date
+        week_date_only = week_start_date.date()
+        all_staff = self.db.query(models.Staff).all()
+        for staff in all_staff:
+            existing_count = self.db.query(models.WeekAssignment).filter(
+                models.WeekAssignment.staff_id == staff.id,
+                cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+            ).count()
+            staff_shift_counts[staff.id] = existing_count
+
+        print(f"DEBUG: validate_and_apply_schedule called with {len(schedule_result.get('assignments', []))} assignments")
+        print(f"DEBUG: Week start date: {week_start_date}")
+        print(f"DEBUG: Initial shift counts: {staff_shift_counts}")
+
+        for assignment_data in schedule_result.get("assignments", []):
+            template_id = assignment_data["shift_template_id"]
+            staff_id = assignment_data["staff_id"]
+            day_of_week = assignment_data.get("day_of_week")
+
+            if day_of_week is None:
+                print(f"DEBUG: FAILED - Missing day_of_week in assignment")
+                failed_assignments.append({
+                    "shift_template_id": template_id,
+                    "staff_id": staff_id,
+                    "reason": "Missing day_of_week field"
+                })
+                continue
+
+            print(f"DEBUG: Processing assignment - template_id: {template_id}, staff_id: {staff_id}, day: {day_of_week}")
+
+            # Check if this exact assignment is already in this batch
+            assignment_key = (staff_id, template_id, day_of_week)
+            if assignment_key in assignment_tracker:
+                print(f"DEBUG: SKIPPED - Duplicate in batch: staff {staff_id} -> template {template_id} on day {day_of_week}")
+                failed_assignments.append({
+                    "shift_template_id": template_id,
+                    "staff_id": staff_id,
+                    "day_of_week": day_of_week,
+                    "reason": "Duplicate assignment in AI response"
+                })
+                continue
+
+            assignment_tracker.add(assignment_key)
+
+            # Get template and staff
+            template = next((t for t in shift_templates if t.id == template_id), None)
+            staff = self.db.query(models.Staff).filter(models.Staff.id == staff_id).first()
+
+            if not template or not staff:
+                reason = f"Shift template or staff not found (template={template is not None}, staff={staff is not None})"
+                print(f"DEBUG: FAILED - {reason}")
+                failed_assignments.append({
+                    "shift_template_id": template_id,
+                    "staff_id": staff_id,
+                    "reason": reason
+                })
+                continue
+
+            # Check max shifts per week using batch tracker
+            current_count = staff_shift_counts.get(staff_id, 0)
+            if current_count >= staff.max_shifts_per_week:
+                print(f"DEBUG: FAILED - {staff.name} already at max shifts ({current_count}/{staff.max_shifts_per_week})")
+                failed_assignments.append({
+                    "shift_template_id": template_id,
+                    "staff_id": staff_id,
+                    "day_of_week": day_of_week,
+                    "reason": f"{staff.name} has reached maximum shifts per week ({staff.max_shifts_per_week})"
+                })
+                continue
+
+            # Validate constraints for this specific day
+            valid, violations = self.check_constraints(staff, template, week_start_date, specific_day=day_of_week)
+
+            if not valid:
+                print(f"DEBUG: FAILED - Constraint violations: {violations}")
+                failed_assignments.append({
+                    "shift_template_id": template_id,
+                    "staff_id": staff_id,
+                    "day_of_week": day_of_week,
+                    "reason": "; ".join(violations)
+                })
+                continue
+
+            # Create assignment for this specific day
+            day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            assignment = models.WeekAssignment(
+                shift_template_id=template_id,
+                staff_id=staff_id,
+                week_start_date=week_start_date,
+                day_of_week=day_of_week
+            )
+            self.db.add(assignment)
+
+            # Increment shift count for this staff member
+            staff_shift_counts[staff_id] = staff_shift_counts.get(staff_id, 0) + 1
+
+            print(f"DEBUG: SUCCESS - Created assignment for {staff.name} -> {template.name} on {day_names[day_of_week]} (shift {staff_shift_counts[staff_id]}/{staff.max_shifts_per_week})")
+            successful_assignments.append({
+                "shift_template_id": template_id,
+                "staff_id": staff_id,
+                "day_of_week": day_of_week,
+                "staff_name": staff.name,
+                "shift_name": template.name,
+                "day_name": day_names[day_of_week],
+                "time": f"{template.start_time}-{template.end_time}"
+            })
+
+        self.db.commit()
+        print(f"DEBUG: Committed {len(successful_assignments)} successful assignments to database")
+
+        return {
+            "successful": successful_assignments,
+            "failed": failed_assignments,
+            "conflicts": schedule_result.get("conflicts", []),
+            "fairness_summary": schedule_result.get("fairness_summary", {})
+        }
+
+    def auto_schedule(self, week_start_date: datetime) -> Dict:
+        """Main entry point for automatic scheduling."""
+
+        print(f"DEBUG: auto_schedule called for week starting {week_start_date}")
+
+        # Get all active shift templates
+        shift_templates = self.db.query(models.ShiftTemplate).filter(
+            models.ShiftTemplate.is_active == True
+        ).all()
+
+        print(f"DEBUG: Found {len(shift_templates)} active shift templates")
+
+        if not shift_templates:
+            return {
+                "message": "No shift templates configured",
+                "successful": [],
+                "failed": [],
+                "conflicts": []
+            }
+
+        # Filter to only templates that need more staff
+        from sqlalchemy import func, cast, Date
+
+        templates_to_fill = []
+        week_date_only = week_start_date.date()
+
+        for template in shift_templates:
+            # Check if ANY day in this template needs more staff
+            needs_filling = False
+            for day in template.days_of_week:
+                assigned_count = self.db.query(models.WeekAssignment).filter(
+                    models.WeekAssignment.shift_template_id == template.id,
+                    models.WeekAssignment.day_of_week == day,
+                    cast(models.WeekAssignment.week_start_date, Date) == week_date_only
+                ).count()
+
+                if assigned_count < template.required_staff:
+                    needs_filling = True
+                    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    print(f"DEBUG: Template '{template.name}' on {day_names[day]} - needs {template.required_staff}, has {assigned_count} assigned")
+
+            if needs_filling:
+                templates_to_fill.append(template)
+
+        print(f"DEBUG: {len(templates_to_fill)} templates need to be filled")
+
+        if not templates_to_fill:
+            return {
+                "message": "All shifts are already fully staffed",
+                "successful": [],
+                "failed": [],
+                "conflicts": []
+            }
+
+        # Generate schedule algorithmically
+        schedule_result = self.generate_schedule_algorithmically(templates_to_fill, week_start_date)
+
+        # Validate and apply
+        final_result = self.validate_and_apply_schedule(schedule_result, shift_templates, week_start_date)
+
+        return final_result
