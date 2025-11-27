@@ -1,4 +1,4 @@
-# Shift Scheduler
+# Shift Scheduler - INCOMPLETE
 
 Automatic shift scheduling local application with algorithmic optimization for fair and efficient staff scheduling.
 
